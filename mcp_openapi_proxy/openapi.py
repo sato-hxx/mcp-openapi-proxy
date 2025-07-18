@@ -16,6 +16,34 @@ from .logging_setup import logger
 # Define the required tool name pattern
 TOOL_NAME_REGEX = r"^[a-zA-Z0-9_-]{1,64}$"
 
+def resolve_schema_ref(ref_string: str, spec: Dict) -> Optional[Dict]:
+    """Resolve a JSON Schema $ref reference within an OpenAPI spec.
+    
+    Args:
+        ref_string: The $ref string (e.g., "#/components/schemas/SearchQuery")
+        spec: The complete OpenAPI specification
+        
+    Returns:
+        The resolved schema dict, or None if not found
+    """
+    if not ref_string.startswith("#/"):
+        logger.warning(f"External $ref not supported: {ref_string}")
+        return None
+    
+    # Remove the "#/" prefix and split by "/"
+    path_parts = ref_string[2:].split("/")
+    
+    # Navigate through the spec dict following the path
+    current = spec
+    for part in path_parts:
+        if isinstance(current, dict) and part in current:
+            current = current[part]
+        else:
+            logger.error(f"Could not resolve $ref: {ref_string}")
+            return None
+    
+    return current if isinstance(current, dict) else None
+
 def fetch_openapi_spec(url: str, retries: int = 3) -> Optional[Dict]:
     """Fetch and parse an OpenAPI specification from a URL with retries."""
     logger.debug(f"Fetching OpenAPI spec from URL: {url}")
@@ -253,6 +281,16 @@ def register_functions(spec: Dict) -> List[types.Tool]:
                           json_content = content.get('application/json')
                           if json_content and isinstance(json_content, dict) and 'schema' in json_content:
                                body_schema = json_content['schema']
+                               
+                               # Resolve $ref if present
+                               if '$ref' in body_schema:
+                                   resolved_schema = resolve_schema_ref(body_schema['$ref'], spec)
+                                   if resolved_schema:
+                                       body_schema = resolved_schema
+                                   else:
+                                       logger.warning(f"Could not resolve $ref in requestBody for {function_name}")
+                                       continue
+                               
                                # If body schema is object with properties, merge them
                                if body_schema.get('type') == 'object' and 'properties' in body_schema:
                                     input_schema['properties'].update(body_schema['properties'])
@@ -261,12 +299,6 @@ def register_functions(spec: Dict) -> List[types.Tool]:
                                          for req_prop in body_schema['required']:
                                               if req_prop not in input_schema['required']:
                                                    input_schema['required'].append(req_prop)
-                               # If body schema is not an object or has no properties,
-                               # maybe represent it as a single 'body' parameter? Needs decision.
-                               # else:
-                               #    input_schema['properties']['body'] = body_schema
-                               #    if request_body.get('required', False):
-                               #         input_schema['required'].append('body')
 
 
                 # Create and register the tool
