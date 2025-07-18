@@ -8,11 +8,21 @@ import sys
 import json
 import requests
 import yaml
+import hashlib
 from typing import Dict, Optional, Tuple, List, Union
 from mcp import types
 
 # Import the configured logger
 from .logging_setup import logger
+
+# ツール名のプロトコル最大長を60文字に設定
+PROTOCOL_MAX_LENGTH = 60
+
+# 正規表現は変わらないが、PROTOCOL_MAX_LENGTH に合わせてリテラルを調整する必要がある場合がある
+# 現状の正規表現は64まで許可しているので、このままでOK。
+# 実際には、正規表現自体も`{1,}`のように柔軟にしておき、別途長さチェックを行うのが良いが、
+# 現在の要件に合わせて、60文字を超える場合は後続の処理で対応する。
+TOOL_NAME_REGEX_COMPILED = re.compile(r"^[a-zA-Z0-9_-]{1,64}$")
 
 def setup_logging(debug: bool = False):
     """
@@ -23,14 +33,20 @@ def setup_logging(debug: bool = False):
 
 def normalize_tool_name(raw_name: str, max_length: Optional[int] = None) -> str:
     """
-    Convert an HTTP method and path into a normalized tool name, applying length limits.
+    Convert an HTTP method and path into a normalized tool name,
+    applying character sanitization, length limits, and ensuring uniqueness with hashing.
+    'max_length' can override the protocol limit for specific use cases.
     """
     try:
-        # Defensive: Only process if raw_name contains a space (method and path)
         if " " not in raw_name:
             logger.warning(f"Malformed raw tool name received: '{raw_name}'. Returning 'unknown_tool'.")
             return "unknown_tool"
         method, path = raw_name.split(" ", 1)
+
+        # --- コロンのサニタイズ ---
+        # パス内のコロンをアンダースコアに置換
+        path = path.replace(':', '_')
+
 
         # Remove common uninformative url prefixes and leading/trailing slashes
         path = re.sub(r"/(api|rest|public)/?", "/", path).lstrip("/").rstrip("/")
@@ -43,74 +59,91 @@ def normalize_tool_name(raw_name: str, max_length: Optional[int] = None) -> str:
         normalized_parts = []
         for part in path.split("/"):
             if url_template_pattern.search(part):
-                # Replace path parameters with "by_param" format
                 params = url_template_pattern.findall(part)
                 base = url_template_pattern.sub("", part)
-                # Lowercase parameters to ensure consistency
                 part = f"{base}_by_{'_'.join(p.lower() for p in params)}"
 
-            # Clean up part and add to list
-            # Added .replace('+', '_') here
             part = part.replace(".", "_").replace("-", "_").replace("+", "_")
-            if part:  # Skip empty parts
+            if part:
                 normalized_parts.append(part)
 
-        # Combine and clean final result
-        tool_name = f"{method.lower()}_{'_'.join(normalized_parts)}"
-        # Remove repeated underscores
-        tool_name = re.sub(r"_+", "_", tool_name).strip("_")
+        base_tool_name = f"{method.lower()}_{'_'.join(normalized_parts)}"
+        base_tool_name = re.sub(r"_+", "_", base_tool_name).strip("_")
 
-        # Apply TOOL_NAME_PREFIX if set
         tool_name_prefix = os.getenv("TOOL_NAME_PREFIX", "")
         if tool_name_prefix:
-            tool_name = f"{tool_name_prefix}{tool_name}"
+            base_tool_name = f"{tool_name_prefix}{base_tool_name}"
 
-        # Determine the effective custom max length based on env var and argument
-        effective_max_length: Optional[int] = max_length
-        if effective_max_length is None:
+
+        # --- 最終的な長さ制限を決定 ---
+        # 引数で渡されたmax_length > 環境変数 > PROTOCOL_MAX_LENGTH の優先順位
+        effective_max_length = PROTOCOL_MAX_LENGTH # デフォルトはプロトコル制限
+        limit_source = "protocol"
+
+        if max_length is not None:
+            # 引数で渡された場合はそれを優先
+            if max_length > 0:
+                effective_max_length = max_length
+                limit_source = f"argument ({max_length})"
+            else:
+                logger.warning(f"Invalid max_length argument: {max_length}. Ignoring.")
+        else:
+            # 引数がない場合、環境変数を確認
             max_length_env = os.getenv("TOOL_NAME_MAX_LENGTH")
             if max_length_env:
                 try:
                     parsed_max_length = int(max_length_env)
                     if parsed_max_length > 0:
                         effective_max_length = parsed_max_length
+                        limit_source = f"env var ({parsed_max_length})"
                     else:
                         logger.warning(f"Invalid TOOL_NAME_MAX_LENGTH env var: {max_length_env}. Ignoring.")
                 except ValueError:
                     logger.warning(f"Invalid TOOL_NAME_MAX_LENGTH env var: {max_length_env}. Ignoring.")
 
-        # Protocol limit
-        PROTOCOL_MAX_LENGTH = 64
+        # ただし、最終的な有効な制限はPROTOCOL_MAX_LENGTHを超えることはない
+        if effective_max_length > PROTOCOL_MAX_LENGTH:
+            effective_max_length = PROTOCOL_MAX_LENGTH
+            limit_source = f"{limit_source} (capped by protocol limit of {PROTOCOL_MAX_LENGTH})"
 
-        # Determine the final length limit, respecting both custom and protocol limits
-        final_limit = PROTOCOL_MAX_LENGTH
-        limit_source = "protocol"
-        if effective_max_length is not None:
-            # If custom limit is set, it takes precedence, but cannot exceed protocol limit
-            if effective_max_length < PROTOCOL_MAX_LENGTH:
-                 final_limit = effective_max_length
-                 limit_source = f"custom ({effective_max_length})"
-            else:
-                 # Custom limit is >= protocol limit, so protocol limit is the effective one
-                 final_limit = PROTOCOL_MAX_LENGTH
-                 limit_source = f"protocol (custom limit was {effective_max_length})"
+        # --- 長さ制限と重複回避のロジックを適用 ---
+        final_tool_name = base_tool_name
+        original_length = len(base_tool_name)
 
-
-        original_length = len(tool_name)
-
-        # Truncate if necessary
-        if original_length > final_limit:
+        if original_length > effective_max_length:
             logger.warning(
-                f"Tool name '{tool_name}' ({original_length} chars) exceeds {limit_source} limit of {final_limit} chars; truncating."
+                f"Tool name '{base_tool_name}' ({original_length} chars) "
+                f"exceeds {limit_source} limit of {effective_max_length} chars; attempting to generate unique shorter name."
             )
-            tool_name = tool_name[:final_limit]
 
-        logger.info(f"Final tool name: {tool_name}, length: {len(tool_name)}")
+            # ユニーク性を高めるために、元のraw_nameからハッシュ値を末尾に追加する
+            path_hash = hashlib.sha256(raw_name.encode('utf-8')).hexdigest()[:6]
 
-        return tool_name
+            # ハッシュを付与しても effective_max_length を超えないように、残りの長さを計算
+            remaining_length = effective_max_length - (len(path_hash) + 1) # +1はアンダースコア用
+
+            if remaining_length > 0:
+                final_tool_name = base_tool_name[:remaining_length] + '_' + path_hash
+            else:
+                final_tool_name = path_hash # 6文字なので制限は超えない
+
+            logger.info(f"Final tool name (hashed): {final_tool_name}, length: {len(final_tool_name)}")
+        else:
+            # 長さ制限を超えない場合はそのまま使用
+            logger.info(f"Final tool name: {final_tool_name}, length: {len(final_tool_name)}")
+
+
+        # 最終的な名前が正規表現にマッチするか確認（念のため）
+        # この正規表現は64文字まで許可しているので、effective_max_lengthが60でも問題ない
+        if not TOOL_NAME_REGEX_COMPILED.match(final_tool_name):
+            logger.error(f"Generated tool name '{final_tool_name}' (from '{raw_name}') still does not match regex '{TOOL_NAME_REGEX_COMPILED.pattern}'. Falling back to simple hash.")
+            final_tool_name = hashlib.sha256(raw_name.encode('utf-8')).hexdigest()[:PROTOCOL_MAX_LENGTH]
+            final_tool_name = final_tool_name.replace(':', '_').replace('.', '_') # 念のためコロンなどを除去
+
+        return final_tool_name
     except Exception as e:
         logger.error(f"Error normalizing tool name '{raw_name}': {e}", exc_info=True)
-        return "unknown_tool" # Return a default on unexpected error
+        return "unknown_tool"
 
 def fetch_openapi_spec(url: str, retries: int = 3) -> Optional[Dict]:
     """
