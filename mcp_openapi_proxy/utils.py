@@ -256,7 +256,21 @@ def handle_auth(operation: Dict) -> Dict[str, str]:
     Handle authentication based on environment variables and operation security.
     """
     headers = {}
+    
+    # First try to get API_KEY from environment variable
     api_key = os.getenv("API_KEY")
+    
+    # If not found in env var, try to read from token file
+    if not api_key:
+        token_file_path = os.getenv("TOKEN_FILE_PATH", "current-anypoint-token.txt")
+        try:
+            with open(token_file_path, 'r', encoding='utf-8') as f:
+                api_key = f.read().strip()
+            if api_key:
+                logger.debug(f"Using API_KEY from token file: {token_file_path}")
+        except (FileNotFoundError, OSError) as e:
+            logger.debug(f"Could not read token file {token_file_path}: {e}")
+    
     auth_type = os.getenv("API_AUTH_TYPE", "Bearer").lower()
     if api_key:
         if auth_type == "bearer":

@@ -18,21 +18,21 @@ TOOL_NAME_REGEX = r"^[a-zA-Z0-9_-]{1,64}$"
 
 def resolve_schema_ref(ref_string: str, spec: Dict) -> Optional[Dict]:
     """Resolve a JSON Schema $ref reference within an OpenAPI spec.
-    
+
     Args:
         ref_string: The $ref string (e.g., "#/components/schemas/SearchQuery")
         spec: The complete OpenAPI specification
-        
+
     Returns:
         The resolved schema dict, or None if not found
     """
     if not ref_string.startswith("#/"):
         logger.warning(f"External $ref not supported: {ref_string}")
         return None
-    
+
     # Remove the "#/" prefix and split by "/"
     path_parts = ref_string[2:].split("/")
-    
+
     # Navigate through the spec dict following the path
     current = spec
     for part in path_parts:
@@ -41,7 +41,7 @@ def resolve_schema_ref(ref_string: str, spec: Dict) -> Optional[Dict]:
         else:
             logger.error(f"Could not resolve $ref: {ref_string}")
             return None
-    
+
     return current if isinstance(current, dict) else None
 
 def fetch_openapi_spec(url: str, retries: int = 3) -> Optional[Dict]:
@@ -132,7 +132,21 @@ def build_base_url(spec: Dict) -> Optional[str]:
 def handle_auth(operation: Dict) -> Dict[str, str]:
     """Handle authentication based on environment variables and operation security."""
     headers = {}
+    
+    # First try to get API_KEY from environment variable
     api_key = os.getenv("API_KEY")
+    
+    # If not found in env var, try to read from token file
+    if not api_key:
+        token_file_path = os.getenv("TOKEN_FILE_PATH", "current-anypoint-token.txt")
+        try:
+            with open(token_file_path, 'r', encoding='utf-8') as f:
+                api_key = f.read().strip()
+            if api_key:
+                logger.debug(f"Using API_KEY from token file: {token_file_path}")
+        except (FileNotFoundError, OSError) as e:
+            logger.debug(f"Could not read token file {token_file_path}: {e}")
+    
     auth_type = os.getenv("API_AUTH_TYPE", "Bearer").lower()
     if api_key:
         if auth_type == "bearer":
@@ -281,7 +295,7 @@ def register_functions(spec: Dict) -> List[types.Tool]:
                           json_content = content.get('application/json')
                           if json_content and isinstance(json_content, dict) and 'schema' in json_content:
                                body_schema = json_content['schema']
-                               
+
                                # Resolve $ref if present
                                if '$ref' in body_schema:
                                    resolved_schema = resolve_schema_ref(body_schema['$ref'], spec)
@@ -290,7 +304,7 @@ def register_functions(spec: Dict) -> List[types.Tool]:
                                    else:
                                        logger.warning(f"Could not resolve $ref in requestBody for {function_name}")
                                        continue
-                               
+
                                # If body schema is object with properties, merge them
                                if body_schema.get('type') == 'object' and 'properties' in body_schema:
                                     input_schema['properties'].update(body_schema['properties'])
@@ -352,6 +366,7 @@ def lookup_operation_details(function_name: str, spec: Dict) -> Union[Dict, None
                   # logger.warning(f"Normalized name '{current_function_name}' for '{raw_name}' is invalid during lookup.")
                   continue # Skip potentially invalid names
 
+             # logger.debug(f"Comparing tool names: generated='{current_function_name}', requested='{function_name}'")
              if current_function_name == function_name:
                  logger.debug(f"Found operation details for '{function_name}' at {method.upper()} {path}")
                  return {"path": path, "method": method.upper(), "operation": operation, "original_path": path}

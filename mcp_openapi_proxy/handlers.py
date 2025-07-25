@@ -151,6 +151,8 @@ async def dispatcher_handler(request: types.CallToolRequest) -> Any:
             ignore_ssl_tools = os.getenv("IGNORE_SSL_TOOLS", "false").lower() in ("true", "1", "yes")
             verify_ssl_tools = not ignore_ssl_tools
             logger.debug(f"Sending API request with SSL verification: {verify_ssl_tools} (IGNORE_SSL_TOOLS={ignore_ssl_tools})")
+            
+            # First attempt
             response = requests.request(
                 method=method,
                 url=api_url,
@@ -159,6 +161,27 @@ async def dispatcher_handler(request: types.CallToolRequest) -> Any:
                 json=request_body if method != "GET" else None,
                 verify=verify_ssl_tools,
             )
+            
+            # Check for 401 (Unauthorized) and retry with fresh token
+            if response.status_code == 401:
+                logger.warning("Received 401 Unauthorized. Attempting to refresh headers and retry...")
+                
+                # Refresh auth headers (this will re-read token file)
+                refreshed_headers = handle_auth(operation)
+                additional_headers = get_additional_headers()
+                refreshed_headers = {**refreshed_headers, **additional_headers}
+                
+                # Retry the request with fresh headers
+                response = requests.request(
+                    method=method,
+                    url=api_url,
+                    headers=refreshed_headers,
+                    params=request_params if method == "GET" else None,
+                    json=request_body if method != "GET" else None,
+                    verify=verify_ssl_tools,
+                )
+                logger.info("Retried request with refreshed token")
+            
             response.raise_for_status()
             response_text = (response.text or "No response body").strip()
             content, log_message = detect_response_type(response_text)
